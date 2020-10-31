@@ -1,0 +1,163 @@
+---
+- hosts: lb
+  become: yes
+  tasks:
+    - name: Install HAProxy
+      apt:
+        name: haproxy
+    - name: Configure HAProxy
+      copy:
+        src: lb/haproxy.cfg
+        dest: /etc/haproxy/haproxy.cfg
+      notify:
+        - Restart HAProxy
+  handlers:
+    - name: Restart HAProxy
+      systemd:
+        name: haproxy
+        state: restarted
+        enabled: yes
+- hosts: controlplane
+  become: yes
+  tasks:
+    - name: Copy ssh key
+      copy:
+        src: "insecure/{{ item }}"
+        dest: /root/.ssh
+        owner: root
+        group: root
+        mode: 0600
+      with_items:
+        - id_rsa
+        - authorized_keys
+    - name: Copy ssh pub
+      copy:
+        src: insecure/id_rsa.pub
+        dest: /root/.ssh
+        owner: root
+        group: root
+        mode: 0644
+    # Install Docker, Kubelet, Kubeadm, Kubectl
+    - import_tasks: tasks/kubeadm.yaml
+    - name: Download config images
+      shell: kubeadm config images pull
+    - name: Create etcd pki directory
+      file:
+        path: /etc/kubernetes/pki/etcd
+        state: directory
+        recurse: yes
+- hosts: etcd
+  become: yes
+  tasks:
+    - name: Copy ssh key
+      copy:
+        src: "insecure/{{ item }}"
+        dest: /root/.ssh
+        owner: root
+        group: root
+        mode: 0600
+      with_items:
+        - id_rsa
+        - authorized_keys
+    - name: Copy ssh pub
+      copy:
+        src: insecure/id_rsa.pub
+        dest: /root/.ssh
+        owner: root
+        group: root
+        mode: 0644
+    - name: Get keyscan
+      shell: ssh-keyscan -t ecdsa {{ item }}
+      with_items:
+        - 192.168.10.111 # control plane
+        - 192.168.10.121 # etcd
+        - 192.168.10.122
+        - 192.168.10.123
+      register: keyscan
+    - name: Add known hosts
+      lineinfile:
+        name: /root/.ssh/known_hosts
+        create: yes
+        line: "{{ item.stdout }}"
+      with_items:
+        - "{{ keyscan.results }}"
+    # Install Docker, Kubelet, Kubeadm, Kubectl
+    - import_tasks: tasks/kubeadm.yaml
+    # ETCD Cluster Setup
+    - name: Service priority
+      copy:
+        dest: /etc/systemd/system/kubelet.service.d/20-etcd-service-manager.conf
+        content: |
+          [Service]
+          ExecStart=
+          #  Replace "systemd" with the cgroup driver of your container runtime. The default value in the kubelet is "cgroupfs".
+          ExecStart=/usr/bin/kubelet --address=127.0.0.1 --pod-manifest-path=/etc/kubernetes/manifests --cgroup-driver=systemd
+          Restart=always
+    - name: Restart kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+    - name: Set up kubeadm
+      when: ansible_hostname == 'etcd-1'
+      script: etcd/kubeadm.sh
+      args:
+        executable: /bin/bash
+      environment:
+        HOST0: 192.168.10.121
+        HOST1: 192.168.10.122
+        HOST2: 192.168.10.123
+    - name: Copy certificates and kubeadm configs on ETCD 2, 3
+      when: ansible_hostname == item
+      copy:
+        remote_src: yes
+        src: /root/pki
+        dest: /etc/kubernetes/
+        owner: root
+        group: root
+      with_items:
+        - etcd-2
+        - etcd-3
+    - name: Create the static pod manifests on ETCD 1
+      when: ansible_hostname == 'etcd-1'
+      shell: kubeadm init phase etcd local --config=/tmp/${HOST0}/kubeadmcfg.yaml
+      environment:
+        HOST0: 192.168.10.121
+    - name: Create the static pod manifests on ETCD 2, 3
+      when: ansible_hostname == item
+      shell: kubeadm init phase etcd local --config=/root/kubeadmcfg.yaml
+      with_items:
+        - etcd-2
+        - etcd-3
+    - name: Send pki to control plane 1
+      when: ansible_hostname == 'etcd-1'
+      shell: |
+        scp /etc/kubernetes/pki/etcd/ca.crt root@192.168.10.111:/etc/kubernetes/pki/etcd/ca.crt;
+        scp /etc/kubernetes/pki/apiserver-etcd-client.crt root@192.168.10.111:/etc/kubernetes/pki/apiserver-etcd-client.crt;
+        scp /etc/kubernetes/pki/apiserver-etcd-client.key root@192.168.10.111:/etc/kubernetes/pki/apiserver-etcd-client.key;
+- hosts: controlplane-1
+  become: yes
+  tasks:
+    - name: Create kubeadm-config.yaml
+      copy:
+        dest: /root/kubeadm-config.yaml
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta2
+          kind: ClusterConfiguration
+          kubernetesVersion: stable
+          controlPlaneEndpoint: "192.168.10.101:6443"
+          etcd:
+            external:
+              endpoints:
+              - https://192.168.10.121:2379
+              - https://192.168.10.122:2379
+              - https://192.168.10.123:2379
+              caFile: /etc/kubernetes/pki/etcd/ca.crt
+              certFile: /etc/kubernetes/pki/apiserver-etcd-client.crt
+              keyFile: /etc/kubernetes/pki/apiserver-etcd-client.key
+- hosts: worker
+  become: yes
+  tasks:
+    # Install Docker, Kubelet, Kubeadm, Kubectl
+    - import_tasks: tasks/kubeadm.yaml

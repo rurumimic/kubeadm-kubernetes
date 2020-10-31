@@ -1,0 +1,87 @@
+## Prepare
+- name: Disable swap
+  shell: swapoff -a
+- name: Load br_netfilter module
+  shell: modprobe br_netfilter
+- name: Create sysctl file
+  copy:
+    dest: /etc/sysctl.d/k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.bridge.bridge-nf-call-iptables = 1
+- name: Applying sysctl
+  shell: sysctl --system
+## Docker
+- name: Install docker pacakges
+  apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - software-properties-common
+      - gnupg2
+    update_cache: yes
+- name: Get Docker's official GPG key
+  apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+- name: Add the Docker apt repository
+  shell: "add-apt-repository 'deb [arch=amd64] https://download.docker.com/linux/ubuntu xenial stable'"
+- name: Install Docker CE
+  apt:
+    name:
+      - containerd.io=1.2.13-2
+      - docker-ce=5:19.03.11~3-0~ubuntu-xenial
+      - docker-ce-cli=5:19.03.11~3-0~ubuntu-xenial
+    update_cache: yes
+- name: Set up the Docker daemon
+  copy:
+    dest: /etc/docker/daemon.json
+    content: |
+      {
+        "exec-opts": ["native.cgroupdriver=systemd"],
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "100m"
+        },
+        "storage-driver": "overlay2"
+      }
+- name: Create a docker service
+  file:
+    path: /etc/systemd/system/docker.service.d
+    state: directory
+- name: Restart docker
+  systemd:
+    name: docker
+    state: restarted
+    enabled: yes
+    daemon_reload: yes
+## Common
+- name: Get Google GPG key
+  apt_key:
+    url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+    state: present
+- name: Add kubernetes apt sources
+  copy:
+    dest: /etc/apt/sources.list.d/kubernetes.list
+    content: deb https://apt.kubernetes.io/ kubernetes-xenial main
+- name: Install Kubectl
+  apt:
+    name: 
+      - kubelet
+      - kubeadm
+      - kubectl
+      - bash-completion
+    update_cache: yes
+- name: Apt-mark hold
+  shell: apt-mark hold kubelet kubeadm kubectl
+## Kubectl
+- name: Enable kubectl autocompletion
+  blockinfile:
+    dest: /etc/bash.bashrc
+    content: |
+      source <(kubectl completion bash)
+      alias k=kubectl
+      complete -F __start_kubectl k
+- name: Add the completion script
+  shell: kubectl completion bash >/etc/bash_completion.d/kubectl
